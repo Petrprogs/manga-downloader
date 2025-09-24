@@ -1,3 +1,22 @@
+"""
+Manga Downloader - Автоматический скачиватель манги с com-x.life
+
+Этот скрипт автоматически:
+1. Открывает браузер и авторизуется на сайте
+2. Отслеживает страницы манги
+3. Скачивает все главы в формате ZIP
+4. Объединяет их в единый CBZ файл
+
+Требования:
+- Python 3.7+
+- PyQt5
+- Selenium
+- Chrome браузер
+- requests
+
+Автор: AI Assistant
+"""
+
 import sys
 import re
 import json
@@ -16,15 +35,30 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 
 class MangaDownloader(QThread):
+    """
+    Класс для автоматического скачивания манги с сайта com-x.life
+    
+    Функциональность:
+    - Автоматическое открытие браузера и авторизация
+    - Отслеживание страниц манги
+    - Скачивание всех глав в формате ZIP
+    - Объединение в единый CBZ файл
+    """
     log = pyqtSignal(str)
     finished = pyqtSignal(bool)
     download_started = pyqtSignal()
 
+    # Константы
+    COOKIE_FILE = "comx_life_cookies_v2.json"
+    DOWNLOADS_DIR = "downloads"
+    TEMP_DIR = "combined_cbz_temp"
+    REQUEST_DELAY = 0.5  # Задержка между запросами в секундах
+    
     def __init__(self):
         super().__init__()
         self.url = None
         self.cookies = None
-        self.cookie_file = Path("comx_life_cookies_v2.json")
+        self.cookie_file = Path(self.COOKIE_FILE)
         self.headers = {
             "Referer": "https://comx.life/",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
@@ -47,7 +81,7 @@ class MangaDownloader(QThread):
         self._is_cancelled = True
 
     def cleanup(self):
-        for dir_name in ["downloads", "combined_cbz_temp"]:
+        for dir_name in [self.DOWNLOADS_DIR, self.TEMP_DIR]:
             dir_path = Path(dir_name)
             if dir_path.exists():
                 shutil.rmtree(dir_path)
@@ -136,6 +170,28 @@ class MangaDownloader(QThread):
                 return
 
     def download_manga(self):
+        """Основной метод скачивания манги"""
+        if not self._load_cookies():
+            return
+            
+        manga_data = self._get_manga_data()
+        if not manga_data:
+            return
+            
+        chapters, manga_title, news_id = manga_data
+        final_cbz = self._prepare_directories(manga_title)
+        
+        self._download_chapters(chapters, news_id)
+        
+        if not self._is_cancelled:
+            self._create_cbz_archive(final_cbz)
+        
+        self.cleanup()
+        if not self._is_cancelled:
+            self.log.emit(f"✅ Готово: {final_cbz.resolve()}")
+
+    def _load_cookies(self):
+        """Загружает cookies из файла если они не заданы"""
         if not self.cookies:
             self.log.emit("⚠️ Предупреждение: cookies не заданы — загружаю из файла")
             try:
@@ -146,31 +202,55 @@ class MangaDownloader(QThread):
                     ]
             except Exception as e:
                 self.log.emit(f"❌ Не удалось загрузить cookies из файла: {e}")
-                return
+                return False
+        return True
 
+    def _get_manga_data(self):
+        """Получает данные манги из HTML страницы"""
         self.download_started.emit()
         self.log.emit(f"📥 Скачивание HTML: {self.url}")
+        
         resp = requests.get(self.url, headers=self.headers, cookies={c['name']: c['value'] for c in self.cookies})
         html = resp.text
 
         match = re.search(r'window\.__DATA__\s*=\s*({.*?})\s*;', html, re.DOTALL)
         if not match:
             self.log.emit("❌ Не найден window.__DATA__")
-            return
+            return None
 
         data = json.loads(match.group(1))
         chapters = data["chapters"][::-1]
         manga_title = data.get("title", "Manga").strip()
+        
+        # Извлекаем news_id из данных или URL
+        news_id = data.get("news_id")
+        if not news_id:
+            url_match = re.search(r'/(\d+)-', self.url)
+            if url_match:
+                news_id = url_match.group(1)
+            else:
+                self.log.emit("❌ news_id не найден ни в данных, ни в URL!")
+                return None
+                
+        return chapters, manga_title, news_id
+
+    def _prepare_directories(self, manga_title):
+        """Подготавливает директории для скачивания"""
         manga_title_safe = re.sub(r"[^\w\- ]", "_", manga_title)
         final_cbz = Path(f"{manga_title_safe}.cbz")
-
-        downloads_dir = Path("downloads")
-        combined_dir = Path("combined_cbz_temp")
-
+        
+        downloads_dir = Path(self.DOWNLOADS_DIR)
+        combined_dir = Path(self.TEMP_DIR)
+        
         downloads_dir.mkdir(exist_ok=True)
         combined_dir.mkdir(exist_ok=True)
+        
+        return final_cbz
 
+    def _download_chapters(self, chapters, news_id):
+        """Скачивает все главы манги"""
         self.log.emit(f"🔢 Глав: {len(chapters)}")
+        
         for i, chapter in enumerate(chapters, 1):
             if self._is_cancelled:
                 self.log.emit("❌ Скачивание отменено")
@@ -179,66 +259,69 @@ class MangaDownloader(QThread):
 
             title = chapter["title"]
             chapter_id = chapter["id"]
-            news_id = data["news_id"]
             filename = re.sub(r"[^\w\- ]", "_", f"{i:06}_{title}") + ".zip"
-            zip_path = downloads_dir / filename
+            zip_path = Path(self.DOWNLOADS_DIR) / filename
 
             self.log.emit(f"⬇️ {i}/{len(chapters)}: {title}")
+            
+            if self._download_chapter(chapter_id, news_id, zip_path, title):
+                self.log.emit(f"✅ Скачано: {title}")
+            
+            # Небольшая задержка между запросами
+            time.sleep(self.REQUEST_DELAY)
 
-            try:
-                # Подготовка POST-запроса
-                payload = f"chapter_id={chapter_id}&news_id={news_id}"
-                headers = {
-                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                    "Referer": self.url,
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Origin": "https://comx.life",
-                    "User-Agent": self.headers["User-Agent"]
-                }
+    def _download_chapter(self, chapter_id, news_id, zip_path, title):
+        """Скачивает одну главу манги"""
+        try:
+            # Подготовка запроса
+            payload = f"chapter_id={chapter_id}&news_id={news_id}"
+            domain = "https://com-x.life" if "com-x.life" in self.url else "https://comx.life"
+            
+            headers = {
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Referer": self.url,
+                "X-Requested-With": "XMLHttpRequest",
+                "Origin": domain,
+                "User-Agent": self.headers["User-Agent"]
+            }
 
-                cookies = {c["name"]: c["value"] for c in self.cookies}
-                link_resp = requests.post(
-                    "https://comx.life/engine/ajax/controller.php?mod=api&action=chapters/download",
-                    headers=headers,
-                    data=payload,
-                    cookies=cookies
-                )
+            cookies = {c["name"]: c["value"] for c in self.cookies}
+            
+            # Получаем ссылку на скачивание
+            api_url = f"{domain}/engine/ajax/controller.php?mod=api&action=chapters/download"
+            link_resp = requests.post(api_url, headers=headers, data=payload, cookies=cookies)
+            
+            if link_resp.status_code != 200:
+                raise ValueError(f"Ошибка API: {link_resp.status_code}")
 
-                try:
-                    json_data = link_resp.json()
-                    raw_url = json_data.get("data")
-                    if not raw_url:
-                        raise ValueError("Поле 'data' не найдено в JSON")
+            json_data = link_resp.json()
+            raw_url = json_data.get("data")
+            if not raw_url:
+                raise ValueError("Поле 'data' не найдено в JSON")
 
-                    # Преобразуем \/\/ в // и добавляем протокол
-                    download_url = "https:" + raw_url.replace("\\/", "/")
+            # Скачиваем файл
+            download_url = "https:" + raw_url.replace("\\/", "/")
+            r = requests.get(download_url, headers=self.headers, cookies=cookies)
+            
+            if r.ok:
+                with open(zip_path, "wb") as f:
+                    f.write(r.content)
+                return True
+            else:
+                self.log.emit(f"❌ Ошибка {r.status_code} при скачивании {title}")
+                return False
 
-                    r = requests.get(download_url, headers=self.headers, cookies=cookies)
-                    if r.ok:
-                        with open(zip_path, "wb") as f:
-                            f.write(r.content)
-                    else:
-                        self.log.emit(f"❌ Ошибка {r.status_code} при скачивании {title}")
-                except Exception as e:
-                    self.log.emit(f"❌ Ошибка при обработке главы {title}: {e}")
-                    
-                if r.ok:
-                    with open(zip_path, "wb") as f:
-                        f.write(r.content)
-                else:
-                    self.log.emit(f"❌ Ошибка {r.status_code} при скачивании {title}")
+        except Exception as e:
+            self.log.emit(f"❌ Ошибка при обработке главы {title}: {e}")
+            return False
 
-            except Exception as e:
-                self.log.emit(f"❌ Ошибка при обработке главы {title}: {e}")
-
-        if self._is_cancelled:
-            self.cleanup()
-            return
-
+    def _create_cbz_archive(self, final_cbz):
+        """Создает CBZ архив из скачанных файлов"""
         index = 1
         self.log.emit("📦 Архивация в CBZ...")
+        
         with zipfile.ZipFile(final_cbz, "w") as cbz:
-            for zip_file in sorted(downloads_dir.glob("*.zip")):
+            for zip_file in sorted(Path(self.DOWNLOADS_DIR).glob("*.zip")):
                 if self._is_cancelled:
                     self.log.emit("❌ Архивация отменена")
                     break
@@ -250,25 +333,29 @@ class MangaDownloader(QThread):
 
                         ext = os.path.splitext(name)[1].lower()
                         out_name = f"{index:06}{ext}"
+                        combined_dir = Path(self.TEMP_DIR)
                         z.extract(name, path=combined_dir)
                         os.rename(combined_dir / name, combined_dir / out_name)
                         cbz.write(combined_dir / out_name, arcname=out_name)
                         index += 1
 
-        self.cleanup()
-        if self._is_cancelled:
-            if final_cbz.exists():
-                try:
-                    final_cbz.unlink()
-                    self.log.emit(f"🧹 Удалён неполный архив: {final_cbz}")
-                except Exception as e:
-                    self.log.emit(f"⚠️ Не удалось удалить архив: {e}")
-            return
-
-        self.log.emit(f"✅ Готово: {final_cbz.resolve()}")
+        if self._is_cancelled and final_cbz.exists():
+            try:
+                final_cbz.unlink()
+                self.log.emit(f"🧹 Удалён неполный архив: {final_cbz}")
+            except Exception as e:
+                self.log.emit(f"⚠️ Не удалось удалить архив: {e}")
 
 
 class DownloaderApp(QWidget):
+    """
+    Главное окно приложения для скачивания манги
+    
+    Содержит:
+    - Кнопку запуска скачивания
+    - Кнопку отмены
+    - Область для отображения логов
+    """
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Manga Downloader")
